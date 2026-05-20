@@ -1,10 +1,30 @@
+import 'allergens.dart';
 import 'models.dart';
+
+AllergenSet allergensFor(
+  List<RecipeIngredient> lines,
+  Map<int, Ingredient> ingredientsById,
+) {
+  var s = AllergenSet.empty;
+  for (final line in lines) {
+    final ing = ingredientsById[line.ingredientId];
+    if (ing != null) s = s.union(ing.allergens);
+  }
+  return s;
+}
 
 class LineCost {
   final RecipeIngredient line;
-  final Ingredient ingredient;
+  final Ingredient? ingredient;
+  final IngredientPrice? price;
   final double cost;
-  const LineCost(this.line, this.ingredient, this.cost);
+  bool get missing => price == null;
+  const LineCost({
+    required this.line,
+    required this.ingredient,
+    required this.price,
+    required this.cost,
+  });
 }
 
 class CostBreakdown {
@@ -14,6 +34,7 @@ class CostBreakdown {
   final double labourCost;
   final int yieldPieces;
   final double marginPercent;
+  final List<int> missingPriceIngredientIds;
 
   const CostBreakdown({
     required this.lines,
@@ -22,7 +43,10 @@ class CostBreakdown {
     required this.labourCost,
     required this.yieldPieces,
     required this.marginPercent,
+    required this.missingPriceIngredientIds,
   });
+
+  bool get hasMissingPrices => missingPriceIngredientIds.isNotEmpty;
 
   double get totalCost => ingredientsCost + energyCost + labourCost;
   double get costPerPiece => yieldPieces == 0 ? 0 : totalCost / yieldPieces;
@@ -39,21 +63,33 @@ CostBreakdown computeCost({
   required Recipe recipe,
   required List<RecipeIngredient> lines,
   required Map<int, Ingredient> ingredientsById,
+  required Map<int, IngredientPrice> pricesByIngredientId,
   required AppSettings settings,
+  double? marginOverride,
+  bool? includeLabourOverride,
 }) {
   final lineCosts = <LineCost>[];
+  final missing = <int>[];
   double ingredientsCost = 0;
   for (final line in lines) {
     final ing = ingredientsById[line.ingredientId];
-    if (ing == null) continue;
-    final c = ing.unitCost * line.quantity;
+    final price = pricesByIngredientId[line.ingredientId];
+    final unitCost = price?.unitCost ?? 0;
+    final c = unitCost * line.quantity;
     ingredientsCost += c;
-    lineCosts.add(LineCost(line, ing, c));
+    if (price == null && ing != null) missing.add(line.ingredientId);
+    lineCosts.add(LineCost(
+      line: line,
+      ingredient: ing,
+      price: price,
+      cost: c,
+    ));
   }
 
   final energyKwh = (recipe.ovenMinutes / 60.0) * settings.ovenKw;
   final energyCost = energyKwh * settings.electricityRatePerKwh;
-  final labourCost = settings.includeLabour
+  final useLabour = includeLabourOverride ?? settings.includeLabour;
+  final labourCost = useLabour
       ? (recipe.labourMinutes / 60.0) * settings.hourlyWage
       : 0.0;
 
@@ -63,6 +99,7 @@ CostBreakdown computeCost({
     energyCost: energyCost,
     labourCost: labourCost,
     yieldPieces: recipe.yieldPieces,
-    marginPercent: settings.marginPercent,
+    marginPercent: marginOverride ?? settings.marginPercent,
+    missingPriceIngredientIds: missing,
   );
 }

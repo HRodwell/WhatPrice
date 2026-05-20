@@ -5,12 +5,25 @@ and (optionally) labour. Built with Flutter — runs on Android and Windows.
 
 ## What it does
 
-- Save **ingredients** with the pack size and what you paid (e.g. 1500 g flour for $4.50).
-- Save **recipes**: yield (pieces), bake time, labour time, and ingredient quantities.
-- See a live **cost breakdown** per recipe: ingredients + energy + labour.
-- Get the **cost per piece** and a **suggested sale price** based on your target margin.
-- **Settings**: electricity rate, oven kW, hourly wage, margin %, currency symbol,
-  toggle to include or exclude labour from the cost.
+- Save **ingredients** (identity: name, unit, allergen flags) and a **price per
+  pantry** (e.g. 1500 g flour for $4.50 at Home, $4.20 at Work).
+- Save **recipes**: yield (pieces), bake time, labour time, multi-image carousel,
+  notes, and ingredient quantities. Recipes are shared across pantries.
+- **Calculate tab**: pick a recipe and pantry, tweak margin % and labour
+  inclusion, see the cost breakdown, and save the result as a snapshot. The
+  Recipes list and recipe page read the most recent snapshot per (recipe, pantry).
+- **Production tracking**: log when a recipe was made, in which pantry, with how
+  many batches and free-text notes. Per-recipe history is visible on the
+  recipe page; the recipe list shows a "Made N×" chip.
+- **Bulk PDF export**: multi-select recipes on the list, share/save them as a
+  single zip containing one A4 PDF per recipe.
+- **Allergens**: tag ingredients with allergen flags (gluten, dairy, egg, soy,
+  peanut, tree nut, sesame, sulphite, fish, crustacean, mollusc, celery,
+  mustard, lupin). Recipes display the union of their ingredients' allergens.
+- **Multi-pantry**: separate workspaces with their own prices. Switch via the
+  app-bar pantry chip. Settings → Pantries to rename / add / delete.
+- **Cloud sync (optional)**: bidirectional sync with a self-hosted PocketBase
+  instance over your network. Off by default; see [Cloud sync](#cloud-sync) below.
 
 Pricing formula: `suggested_price = cost ÷ (1 − margin%)`.
 Energy cost: `(bake_minutes / 60) × oven_kW × electricity_rate`.
@@ -56,23 +69,83 @@ flutter build apk --release
 ## Where data lives
 
 A local SQLite database at the platform's app-documents directory
-(`whatprice.db`). No accounts, no cloud — single user, on-device.
+(`whatprice.db`). Images live alongside under `whatprice_images/`. If cloud sync
+is configured, the same data is mirrored to a PocketBase instance.
+
+## Cloud sync
+
+Sync is optional and aimed at running PocketBase on your own server (e.g. a
+Proxmox LXC or VM reachable over your private network — TLS is not required if
+the network itself is trusted, but the Android build allows cleartext HTTP).
+
+### Server setup
+
+1. Download a PocketBase binary from <https://pocketbase.io/docs>.
+2. Start it: `./pocketbase serve --http=0.0.0.0:8090`.
+3. Open the admin UI at `http://<server-ip>:8090/_/` and create an admin user.
+4. Create the collections listed below. **For each one**, set the API rules
+   (List/View/Create/Update/Delete) to an empty string so the app can read/write
+   without an auth token.
+
+### Collections to create
+
+Every collection has these common fields in addition to the ones listed:
+
+- `sync_id` — text, **unique**, required
+- `updated_at` — text (we store ISO 8601 UTC)
+- `deleted_at` — text, nullable (tombstone)
+
+| Collection            | Other fields                                                                                                                                                                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pantries`            | `name` (text)                                                                                                                                                                                                                         |
+| `ingredients`         | `name` (text), `unit` (text), `allergen_flags` (number)                                                                                                                                                                               |
+| `ingredient_prices`   | `pack_size` (number), `pack_cost` (number), `ingredient_sync_id` (text), `pantry_sync_id` (text)                                                                                                                                       |
+| `recipes`             | `name` (text), `yield_pieces` (number), `oven_minutes` (number), `labour_minutes` (number), `notes` (text)                                                                                                                            |
+| `recipe_ingredients`  | `quantity` (number), `recipe_sync_id` (text), `ingredient_sync_id` (text)                                                                                                                                                             |
+| `recipe_images`       | `sort_order` (number), `recipe_sync_id` (text), `image` (file — single file, allow common image MIME types)                                                                                                                            |
+| `recipe_cost_snapshots` | `margin_percent` (number), `include_labour` (number), `ingredients_cost` (number), `energy_cost` (number), `labour_cost` (number), `cost_per_piece` (number), `suggested_price_per_piece` (number), `suggested_batch_price` (number), `computed_at` (text), `recipe_sync_id` (text), `pantry_sync_id` (text) |
+| `productions`         | `made_at` (text), `batches` (number), `cost_per_piece` (number), `notes` (text), `recipe_sync_id` (text), `pantry_sync_id` (text)                                                                                                     |
+
+The `*_sync_id` text fields are how the app cross-references records between
+devices — they store the *target row's* `sync_id`. The app maps them to local
+integer foreign keys on pull.
+
+### App configuration
+
+In Settings → Cloud sync:
+
+1. Enter your server URL (e.g. `http://10.144.1.5:8090`).
+2. Tap **Save URL**.
+3. Tap **Sync now**. The first run uploads everything you have locally and pulls
+   anything that's already on the server.
+
+Subsequent syncs only move the rows that changed since last time. Last-write-
+wins on conflict (newer `updated_at` wins). Soft deletes propagate via the
+`deleted_at` column.
+
+### What's not synced
+
+- App settings (currency symbol, electricity rate, oven kW, hourly wage) are
+  intentionally device-local — each device can have its own electrical setup.
 
 ## Project layout
 
 ```
 lib/
-  main.dart                    app entry, theme
-  models.dart                  Ingredient, Recipe, RecipeIngredient, AppSettings
-  database.dart                SQLite open + schema
-  app_state.dart               ChangeNotifier wrapping CRUD
+  main.dart                    app entry, startup error UI
+  models.dart                  data classes
+  database.dart                SQLite open + migrations
+  app_state.dart               ChangeNotifier wrapping CRUD + soft-delete
   cost.dart                    pure cost calculation
   format.dart                  money / number formatting
-  screens/
-    home_screen.dart           bottom-nav shell
-    recipes_screen.dart        recipes list with cost preview
-    recipe_edit_screen.dart    recipe editor with live cost breakdown
-    ingredients_screen.dart    ingredients list
-    ingredient_edit_screen.dart
-    settings_screen.dart
+  allergens.dart               Allergen enum + bitmask
+  screens/                     all top-level screens
+  services/
+    image_storage.dart         picking + saving recipe images
+    pdf_export.dart            per-recipe PDF generation
+    bulk_export.dart           zip + share/save
+  widgets/                     reusable UI bits
+  sync/
+    collection_defs.dart       per-collection sync schema
+    sync_service.dart          push/pull engine + image upload
 ```

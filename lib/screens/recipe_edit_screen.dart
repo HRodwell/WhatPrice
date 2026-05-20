@@ -1,10 +1,16 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
 import '../cost.dart';
 import '../format.dart';
 import '../models.dart';
+import '../services/image_storage.dart';
+import '../widgets/allergen_chips.dart';
+import '../widgets/production_section.dart';
 
 class RecipeEditScreen extends StatefulWidget {
   const RecipeEditScreen({super.key, this.recipe});
@@ -23,6 +29,11 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
   late final TextEditingController _notes;
 
   List<RecipeIngredient> _lines = [];
+  final List<_ImageEntry> _imageEntries = [];
+  final List<RecipeImage> _imagesToDelete = [];
+  Directory? _imagesDir;
+  final PageController _carousel = PageController();
+  int _carouselIndex = 0;
   bool _loaded = false;
 
   @override
@@ -40,9 +51,14 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
 
   Future<void> _loadLines() async {
     final r = widget.recipe;
+    final state = context.read<AppState>();
+    _imagesDir = await ImageStorage.instance.ensureDir();
     if (r?.id != null) {
-      _lines = await context.read<AppState>().loadRecipeLines(r!.id!);
+      _lines = await state.loadRecipeLines(r!.id!);
+      final imgs = await state.loadRecipeImages(r.id!);
+      _imageEntries.addAll(imgs.map(_ImageEntry.persisted));
     }
+    if (!mounted) return;
     setState(() => _loaded = true);
   }
 
@@ -53,6 +69,7 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
     _oven.dispose();
     _labour.dispose();
     _notes.dispose();
+    _carousel.dispose();
     super.dispose();
   }
 
@@ -69,6 +86,17 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
     );
     final id = await state.upsertRecipe(recipe);
     await state.replaceRecipeLines(id, _lines);
+    for (final img in _imagesToDelete) {
+      await state.removeRecipeImage(img);
+    }
+    final pendingSources = _imageEntries
+        .where((e) => e.source != null)
+        .map((e) => e.source!)
+        .toList();
+    if (pendingSources.isNotEmpty) {
+      final paths = await ImageStorage.instance.storeAll(pendingSources);
+      await state.addRecipeImages(id, paths);
+    }
     if (mounted) Navigator.of(context).pop();
   }
 
@@ -93,6 +121,41 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
     final navigator = Navigator.of(context);
     await context.read<AppState>().deleteRecipe(id);
     navigator.pop();
+  }
+
+  Future<void> _pickImages({required bool camera}) async {
+    final sources =
+        await ImageStorage.instance.pickSources(useCamera: camera);
+    if (sources.isEmpty) return;
+    setState(() {
+      for (final f in sources) {
+        _imageEntries.add(_ImageEntry.pending(f));
+      }
+      _carouselIndex = _imageEntries.length - 1;
+    });
+    if (_carousel.hasClients) {
+      _carousel.jumpToPage(_carouselIndex);
+    }
+  }
+
+  void _removeCurrentImage() {
+    if (_imageEntries.isEmpty) return;
+    final i = _carouselIndex.clamp(0, _imageEntries.length - 1);
+    final entry = _imageEntries[i];
+    setState(() {
+      if (entry.persisted != null) {
+        _imagesToDelete.add(entry.persisted!);
+      }
+      _imageEntries.removeAt(i);
+      if (_imageEntries.isEmpty) {
+        _carouselIndex = 0;
+      } else if (_carouselIndex >= _imageEntries.length) {
+        _carouselIndex = _imageEntries.length - 1;
+      }
+    });
+    if (_imageEntries.isNotEmpty && _carousel.hasClients) {
+      _carousel.jumpToPage(_carouselIndex);
+    }
   }
 
   Future<void> _addOrEditLine([RecipeIngredient? existing]) async {
@@ -128,20 +191,10 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
     final state = context.watch<AppState>();
     final isNew = widget.recipe == null;
     final symbol = state.settings.currencySymbol;
-
-    final breakdown = _loaded
-        ? computeCost(
-            recipe: Recipe(
-              name: _name.text,
-              yieldPieces: int.tryParse(_yield.text) ?? 1,
-              ovenMinutes: double.tryParse(_oven.text) ?? 0,
-              labourMinutes: double.tryParse(_labour.text) ?? 0,
-            ),
-            lines: _lines,
-            ingredientsById: state.ingredientsById,
-            settings: state.settings,
-          )
-        : null;
+    final snapshot = widget.recipe?.id == null
+        ? null
+        : state.snapshotOf(widget.recipe!.id!);
+    final pantryName = state.activePantry.name;
 
     return Scaffold(
       appBar: AppBar(
@@ -163,6 +216,20 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
               child: ListView(
                 padding: const EdgeInsets.fromLTRB(16, 16, 16, 120),
                 children: [
+                  _ImageCarousel(
+                    entries: _imageEntries,
+                    imagesDir: _imagesDir,
+                    controller: _carousel,
+                    currentIndex: _carouselIndex,
+                    onPageChanged: (i) =>
+                        setState(() => _carouselIndex = i),
+                    onAdd: () => _pickImages(camera: false),
+                    onCapture: (Platform.isAndroid || Platform.isIOS)
+                        ? () => _pickImages(camera: true)
+                        : null,
+                    onRemove: _removeCurrentImage,
+                  ),
+                  const SizedBox(height: 16),
                   TextFormField(
                     controller: _name,
                     decoration: const InputDecoration(labelText: 'Recipe name'),
@@ -196,11 +263,8 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
                   const SizedBox(height: 16),
                   TextFormField(
                     controller: _labour,
-                    decoration: InputDecoration(
+                    decoration: const InputDecoration(
                       labelText: 'Labour time (min)',
-                      helperText: state.settings.includeLabour
-                          ? null
-                          : 'Disabled in Settings',
                     ),
                     keyboardType:
                         const TextInputType.numberWithOptions(decimal: true),
@@ -212,6 +276,29 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
                     decoration: const InputDecoration(labelText: 'Notes'),
                     maxLines: 2,
                   ),
+                  if (_loaded) ...[
+                    Builder(builder: (_) {
+                      final allergens = allergensFor(
+                        _lines,
+                        state.ingredientsById,
+                      );
+                      if (allergens.isEmpty) return const SizedBox.shrink();
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Contains',
+                              style: Theme.of(context).textTheme.titleSmall,
+                            ),
+                            const SizedBox(height: 6),
+                            AllergenChipsRow(allergens: allergens),
+                          ],
+                        ),
+                      );
+                    }),
+                  ],
                   const SizedBox(height: 24),
                   _SectionHeader(
                     title: 'Ingredients',
@@ -232,13 +319,21 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
                   else
                     ..._lines.map((line) {
                       final ing = state.ingredientsById[line.ingredientId];
-                      final cost =
-                          (ing?.unitCost ?? 0) * line.quantity;
+                      final price = state.priceFor(line.ingredientId);
+                      final cost = (price?.unitCost ?? 0) * line.quantity;
+                      final missing = price == null && ing != null;
                       return Card(
                         child: ListTile(
                           title: Text(ing?.name ?? 'Unknown'),
                           subtitle: Text(
-                            '${num2(line.quantity)} ${ing?.unit.short ?? ''}   ·   ${money(cost, symbol)}',
+                            missing
+                                ? '${num2(line.quantity)} ${ing.unit.short}   ·   No price in ${state.activePantry.name}'
+                                : '${num2(line.quantity)} ${ing?.unit.short ?? ''}   ·   ${money(cost, symbol)}',
+                            style: missing
+                                ? TextStyle(
+                                    color: Theme.of(context).colorScheme.error,
+                                  )
+                                : null,
                           ),
                           trailing: IconButton(
                             tooltip: 'Remove',
@@ -251,8 +346,15 @@ class _RecipeEditScreenState extends State<RecipeEditScreen> {
                       );
                     }),
                   const SizedBox(height: 24),
-                  if (breakdown != null)
-                    _CostSummary(breakdown: breakdown, symbol: symbol),
+                  _CostSummary(
+                    snapshot: snapshot,
+                    symbol: symbol,
+                    pantryName: pantryName,
+                  ),
+                  if (widget.recipe?.id != null) ...[
+                    const SizedBox(height: 24),
+                    ProductionSection(recipeId: widget.recipe!.id!),
+                  ],
                 ],
               ),
             ),
@@ -305,13 +407,39 @@ class _SectionHeader extends StatelessWidget {
 }
 
 class _CostSummary extends StatelessWidget {
-  const _CostSummary({required this.breakdown, required this.symbol});
-  final CostBreakdown breakdown;
+  const _CostSummary({
+    required this.snapshot,
+    required this.symbol,
+    required this.pantryName,
+  });
+  final RecipeCostSnapshot? snapshot;
   final String symbol;
+  final String pantryName;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    if (snapshot == null) {
+      return Card(
+        color: scheme.surfaceContainerHigh,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Row(
+            children: [
+              Icon(Icons.calculate_outlined, color: scheme.onSurfaceVariant),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  'Not calculated for $pantryName — open the Calculate tab to set a price.',
+                  style: TextStyle(color: scheme.onSurfaceVariant),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    final s = snapshot!;
     return Card(
       color: scheme.surfaceContainerHigh,
       child: Padding(
@@ -319,16 +447,21 @@ class _CostSummary extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Cost breakdown',
+            Text('Cost breakdown ($pantryName)',
                 style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              'Saved ${DateFormat.yMd().add_jm().format(s.computedAt)}'
+              '${s.includeLabour ? '' : '   ·   labour excluded'}',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
             const SizedBox(height: 12),
-            _row('Ingredients', breakdown.ingredientsCost, symbol),
-            _row('Energy', breakdown.energyCost, symbol),
-            if (breakdown.labourCost > 0)
-              _row('Labour', breakdown.labourCost, symbol),
+            _row('Ingredients', s.ingredientsCost, symbol),
+            _row('Energy', s.energyCost, symbol),
+            if (s.labourCost > 0) _row('Labour', s.labourCost, symbol),
             const Divider(height: 24),
-            _row('Total batch', breakdown.totalCost, symbol, bold: true),
-            _row('Per piece', breakdown.costPerPiece, symbol, bold: true),
+            _row('Total batch', s.totalCost, symbol, bold: true),
+            _row('Per piece', s.costPerPiece, symbol, bold: true),
             const SizedBox(height: 12),
             Container(
               padding: const EdgeInsets.all(12),
@@ -338,19 +471,20 @@ class _CostSummary extends StatelessWidget {
               ),
               child: Row(
                 children: [
-                  Icon(Icons.local_offer_outlined, color: scheme.onPrimaryContainer),
+                  Icon(Icons.local_offer_outlined,
+                      color: scheme.onPrimaryContainer),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'Suggested price (${num2(breakdown.marginPercent)}% margin)',
+                          'Suggested price (${num2(s.marginPercent)}% margin)',
                           style: TextStyle(color: scheme.onPrimaryContainer),
                         ),
                         const SizedBox(height: 2),
                         Text(
-                          '${money(breakdown.suggestedPricePerPiece, symbol)} per piece   ·   ${money(breakdown.suggestedBatchPrice, symbol)} per batch',
+                          '${money(s.suggestedPricePerPiece, symbol)} per piece   ·   ${money(s.suggestedBatchPrice, symbol)} per batch',
                           style: TextStyle(
                             color: scheme.onPrimaryContainer,
                             fontWeight: FontWeight.w700,
@@ -474,6 +608,275 @@ class _IngredientLineSheetState extends State<_IngredientLineSheet> {
             },
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _ImageEntry {
+  final RecipeImage? persisted;
+  final File? source;
+  const _ImageEntry._(this.persisted, this.source);
+  factory _ImageEntry.persisted(RecipeImage img) => _ImageEntry._(img, null);
+  factory _ImageEntry.pending(File file) => _ImageEntry._(null, file);
+}
+
+class _ImageCarousel extends StatelessWidget {
+  const _ImageCarousel({
+    required this.entries,
+    required this.imagesDir,
+    required this.controller,
+    required this.currentIndex,
+    required this.onPageChanged,
+    required this.onAdd,
+    required this.onRemove,
+    this.onCapture,
+  });
+
+  final List<_ImageEntry> entries;
+  final Directory? imagesDir;
+  final PageController controller;
+  final int currentIndex;
+  final ValueChanged<int> onPageChanged;
+  final VoidCallback onAdd;
+  final VoidCallback onRemove;
+  final VoidCallback? onCapture;
+
+  File? _resolve(_ImageEntry entry) {
+    if (entry.source != null) return entry.source;
+    if (imagesDir == null) return null;
+    return ImageStorage.instance.resolve(entry.persisted!.path, imagesDir!);
+  }
+
+  void _openViewer(BuildContext context, int initialIndex) {
+    final files = entries.map(_resolve).whereType<File>().toList();
+    if (files.isEmpty) return;
+    Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: false,
+        barrierColor: Colors.black,
+        pageBuilder: (_, __, ___) =>
+            _FullscreenViewer(files: files, initialIndex: initialIndex),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(16),
+      child: Container(
+        height: 220,
+        color: scheme.surfaceContainerHighest,
+        child: entries.isEmpty
+            ? _EmptyState(onAdd: onAdd, onCapture: onCapture)
+            : Stack(
+                fit: StackFit.expand,
+                children: [
+                  PageView.builder(
+                    controller: controller,
+                    onPageChanged: onPageChanged,
+                    itemCount: entries.length,
+                    itemBuilder: (context, i) {
+                      final entry = entries[i];
+                      final file = entry.source ??
+                          (imagesDir == null
+                              ? null
+                              : ImageStorage.instance
+                                  .resolve(entry.persisted!.path, imagesDir!));
+                      if (file == null) {
+                        return const SizedBox.shrink();
+                      }
+                      return GestureDetector(
+                        onTap: () => _openViewer(context, i),
+                        child: Image.file(file, fit: BoxFit.cover),
+                      );
+                    },
+                  ),
+                  if (entries.length > 1)
+                    Positioned(
+                      bottom: 8,
+                      left: 0,
+                      right: 0,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: List.generate(entries.length, (i) {
+                          final selected = i == currentIndex;
+                          return Container(
+                            width: selected ? 10 : 6,
+                            height: selected ? 10 : 6,
+                            margin: const EdgeInsets.symmetric(horizontal: 3),
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.white.withValues(
+                                  alpha: selected ? 0.95 : 0.55),
+                            ),
+                          );
+                        }),
+                      ),
+                    ),
+                  Positioned(
+                    top: 8,
+                    right: 8,
+                    child: _RoundIconButton(
+                      icon: Icons.close,
+                      tooltip: 'Remove image',
+                      onPressed: onRemove,
+                    ),
+                  ),
+                  Positioned(
+                    bottom: 8,
+                    right: 8,
+                    child: Row(
+                      children: [
+                        if (onCapture != null)
+                          Padding(
+                            padding: const EdgeInsets.only(right: 8),
+                            child: _RoundIconButton(
+                              icon: Icons.photo_camera_outlined,
+                              tooltip: 'Take photo',
+                              onPressed: onCapture!,
+                            ),
+                          ),
+                        _RoundIconButton(
+                          icon: Icons.add_photo_alternate_outlined,
+                          tooltip: 'Add images',
+                          onPressed: onAdd,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+}
+
+class _EmptyState extends StatelessWidget {
+  const _EmptyState({required this.onAdd, this.onCapture});
+  final VoidCallback onAdd;
+  final VoidCallback? onCapture;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onAdd,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.add_photo_alternate_outlined, size: 36),
+            const SizedBox(height: 8),
+            const Text('Tap to add photos'),
+            if (onCapture != null) ...[
+              const SizedBox(height: 8),
+              TextButton.icon(
+                onPressed: onCapture,
+                icon: const Icon(Icons.photo_camera_outlined),
+                label: const Text('Take a photo'),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _FullscreenViewer extends StatefulWidget {
+  const _FullscreenViewer({required this.files, required this.initialIndex});
+  final List<File> files;
+  final int initialIndex;
+
+  @override
+  State<_FullscreenViewer> createState() => _FullscreenViewerState();
+}
+
+class _FullscreenViewerState extends State<_FullscreenViewer> {
+  late final PageController _page = PageController(initialPage: widget.initialIndex);
+  late int _index = widget.initialIndex;
+
+  @override
+  void dispose() {
+    _page.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          PageView.builder(
+            controller: _page,
+            itemCount: widget.files.length,
+            onPageChanged: (i) => setState(() => _index = i),
+            itemBuilder: (_, i) => InteractiveViewer(
+              minScale: 1,
+              maxScale: 5,
+              child: Center(
+                child: Image.file(widget.files[i], fit: BoxFit.contain),
+              ),
+            ),
+          ),
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 8,
+            left: 8,
+            child: _RoundIconButton(
+              icon: Icons.close,
+              tooltip: 'Close',
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+          ),
+          if (widget.files.length > 1)
+            Positioned(
+              bottom: MediaQuery.of(context).padding.bottom + 16,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Text(
+                    '${_index + 1} / ${widget.files.length}',
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RoundIconButton extends StatelessWidget {
+  const _RoundIconButton({
+    required this.icon,
+    required this.onPressed,
+    this.tooltip,
+  });
+
+  final IconData icon;
+  final VoidCallback onPressed;
+  final String? tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black.withValues(alpha: 0.45),
+      shape: const CircleBorder(),
+      child: IconButton(
+        tooltip: tooltip,
+        icon: Icon(icon, color: Colors.white),
+        onPressed: onPressed,
       ),
     );
   }

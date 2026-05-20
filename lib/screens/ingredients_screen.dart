@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../app_state.dart';
 import '../format.dart';
 import '../models.dart';
+import '../widgets/allergen_chips.dart';
 import 'ingredient_edit_screen.dart';
 
 class IngredientsScreen extends StatelessWidget {
@@ -24,13 +25,37 @@ class IngredientsScreen extends StatelessWidget {
               separatorBuilder: (_, __) => const SizedBox(height: 8),
               itemBuilder: (context, i) {
                 final ing = items[i];
+                final price = ing.id == null
+                    ? null
+                    : state.priceFor(ing.id!);
                 return Card(
                   child: ListTile(
+                    isThreeLine: ing.allergens.isNotEmpty,
                     title: Text(ing.name,
                         style: const TextStyle(fontWeight: FontWeight.w600)),
-                    subtitle: Text(
-                      '${money(ing.packCost, symbol)} per ${num2(ing.packSize)}${ing.unit.short}'
-                      '   ·   ${money(ing.unitCost, symbol)}/${ing.unit.short}',
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (price == null)
+                          Text(
+                            'No price set for ${state.activePantry.name}',
+                            style: TextStyle(
+                              fontStyle: FontStyle.italic,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant,
+                            ),
+                          )
+                        else
+                          Text(
+                            '${money(price.packCost, symbol)} per ${num2(price.packSize)}${ing.unit.short}'
+                            '   ·   ${money(price.unitCost, symbol)}/${ing.unit.short}',
+                          ),
+                        if (ing.allergens.isNotEmpty) ...[
+                          const SizedBox(height: 6),
+                          AllergenChipsRow(allergens: ing.allergens, dense: true),
+                        ],
+                      ],
                     ),
                     trailing: const Icon(Icons.chevron_right),
                     onTap: () => _open(context, ing),

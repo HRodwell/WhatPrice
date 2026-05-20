@@ -3,6 +3,8 @@ import 'package:provider/provider.dart';
 
 import '../app_state.dart';
 import '../models.dart';
+import '../widgets/pantry_manager.dart';
+import '../widgets/sync_settings.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -15,18 +17,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TextEditingController _elec;
   late TextEditingController _ovenKw;
   late TextEditingController _wage;
-  late TextEditingController _margin;
   late TextEditingController _symbol;
-  late bool _includeLabour;
   bool _initialized = false;
 
   void _hydrate(AppSettings s) {
     _elec = TextEditingController(text: s.electricityRatePerKwh.toString());
     _ovenKw = TextEditingController(text: s.ovenKw.toString());
     _wage = TextEditingController(text: s.hourlyWage.toString());
-    _margin = TextEditingController(text: s.marginPercent.toString());
     _symbol = TextEditingController(text: s.currencySymbol);
-    _includeLabour = s.includeLabour;
     _initialized = true;
   }
 
@@ -36,7 +34,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _elec.dispose();
       _ovenKw.dispose();
       _wage.dispose();
-      _margin.dispose();
       _symbol.dispose();
     }
     super.dispose();
@@ -44,12 +41,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
-    final s = AppSettings(
+    final current = context.read<AppState>().settings;
+    final s = current.copyWith(
       electricityRatePerKwh: double.parse(_elec.text),
       ovenKw: double.parse(_ovenKw.text),
       hourlyWage: double.parse(_wage.text),
-      marginPercent: double.parse(_margin.text),
-      includeLabour: _includeLabour,
       currencySymbol: _symbol.text.trim().isEmpty ? '\$' : _symbol.text.trim(),
     );
     await context.read<AppState>().saveSettings(s);
@@ -100,40 +96,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           _Section(
             title: 'Labour',
-            child: Column(children: [
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Include labour in cost'),
-                value: _includeLabour,
-                onChanged: (v) => setState(() => _includeLabour = v),
-              ),
-              TextFormField(
-                controller: _wage,
-                decoration:
-                    const InputDecoration(labelText: 'Hourly wage'),
-                keyboardType:
-                    const TextInputType.numberWithOptions(decimal: true),
-                validator: _nonNegative,
-              ),
-            ]),
-          ),
-          _Section(
-            title: 'Pricing',
             child: TextFormField(
-              controller: _margin,
+              controller: _wage,
               decoration: const InputDecoration(
-                labelText: 'Target margin (%)',
-                helperText: 'Sale price = cost ÷ (1 − margin)',
+                labelText: 'Hourly wage',
+                helperText:
+                    'Include-labour toggle and margin live in the Calculate tab.',
               ),
               keyboardType:
                   const TextInputType.numberWithOptions(decimal: true),
-              validator: (v) {
-                final n = double.tryParse(v ?? '');
-                if (n == null) return 'Number';
-                if (n < 0 || n >= 100) return '0–99.9';
-                return null;
-              },
+              validator: _nonNegative,
             ),
+          ),
+          const _Section(
+            title: 'Pantries',
+            child: PantryManager(),
+          ),
+          const _Section(
+            title: 'Cloud sync',
+            child: SyncSettings(),
           ),
           const SizedBox(height: 8),
           FilledButton.icon(
